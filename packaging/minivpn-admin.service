@@ -1,0 +1,32 @@
+# Web dashboard on http://127.0.0.1:8090 (reach it through an SSH tunnel:
+#   ssh -L 8090:127.0.0.1:8090 you@server
+# or serve it with TLS: add --listen 0.0.0.0:8443 --tls-cert ... --tls-key ...
+# via `systemctl edit minivpn-admin`).
+[Unit]
+Description=minivpn admin dashboard
+Documentation=file:///usr/share/doc/minivpn/README.md
+After=minivpn-server.service
+ConditionPathExists=/etc/minivpn/server.conf
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/minivpn-admin web --listen 127.0.0.1:8090
+Restart=on-failure
+RestartSec=2s
+
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/minivpn
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

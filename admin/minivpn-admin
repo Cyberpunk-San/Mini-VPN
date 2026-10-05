@@ -1,0 +1,1210 @@
+#!/usr/bin/env python3
+"""minivpn-admin - manage a minivpn server: devices, licenses, web dashboard.
+
+Standard library only. Normally run as root: it edits /etc/minivpn and talks
+to the server's control socket. Set MINIVPN_ETC to use another directory and
+MINIVPN_BIN to point at a specific minivpn binary.
+"""
+
+import argparse
+import base64
+import contextlib
+import datetime as dt
+import fcntl
+import getpass
+import grp
+import hashlib
+import hmac
+import http.server
+import ipaddress
+import json
+import os
+import pwd
+import re
+import secrets
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+VERSION = "2.0.0"
+NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+COMMUNITY_LIMIT = 5
+PBKDF2_ITERATIONS = 310_000
+MIN_PASSWORD = 10
+
+
+class AdminError(Exception):
+    """A problem the user can fix; shown without a traceback (HTTP 400 on the web)."""
+
+
+# --------------------------------------------------------------------------
+# Installation layout and files
+# --------------------------------------------------------------------------
+
+def parse_kv(path):
+    """Parses the same 'key = value' format the C daemon reads."""
+    values = {}
+    with open(path, encoding="utf-8") as f:
+        for n, raw in enumerate(f, 1):
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            if "=" not in line:
+                raise AdminError(f"{path}:{n}: expected 'key = value'")
+            key, value = (s.strip() for s in line.split("=", 1))
+            values[key] = value
+    return values
+
+
+def atomic_write(path, text, mode=0o600, group=None):
+    """Write-then-rename so the daemon never reads a half-written file."""
+    directory = os.path.dirname(os.path.abspath(path))
+    tmp = os.path.join(directory, f".{os.path.basename(path)}.{secrets.token_hex(4)}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        if group is not None and os.geteuid() == 0:
+            os.chown(tmp, 0, group)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
+    dfd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+
+
+class Device:
+    __slots__ = ("id", "key", "ip", "status", "created", "name")
+
+    def __init__(self, id, key, ip, status, created, name):
+        self.id, self.key, self.ip, self.status, self.created, self.name = id, key, ip, status, created, name
+
+    def line(self):
+        return f"{self.id} {self.key} {self.ip} {self.status} {self.created} {self.name}\n"
+
+    def public(self):
+        return {"id": self.id, "name": self.name, "ip": self.ip, "status": self.status, "created": self.created}
+
+
+class Install:
+    """Paths and settings of one minivpn server installation."""
+
+    def __init__(self, etc=None):
+        self.etc = etc or os.environ.get("MINIVPN_ETC", "/etc/minivpn")
+        self.server_conf = os.path.join(self.etc, "server.conf")
+        self.admin_conf = os.path.join(self.etc, "admin.conf")
+        self.audit_log = os.path.join(self.etc, "audit.log")
+        self.lock_path = os.path.join(self.etc, ".admin.lock")
+
+    @property
+    def conf(self):
+        if not os.path.exists(self.server_conf):
+            raise AdminError(f"{self.server_conf} not found. Run: minivpn-admin init --endpoint <public-host-or-ip>")
+        return parse_kv(self.server_conf)
+
+    def setting(self, key, default=None):
+        return self.conf.get(key, default)
+
+    @property
+    def devices_path(self):
+        return self.setting("devices", os.path.join(self.etc, "devices"))
+
+    @property
+    def license_path(self):
+        return self.setting("license", os.path.join(self.etc, "license.key"))
+
+    @property
+    def control_path(self):
+        return self.setting("control_socket", "/run/minivpn/control.sock")
+
+    @property
+    def subnet(self):
+        try:
+            return ipaddress.ip_network(self.setting("subnet", "10.8.0.0/24"), strict=False)
+        except ValueError as e:
+            raise AdminError(f"invalid subnet in {self.server_conf}: {e}")
+
+    @property
+    def server_ip(self):
+        return self.subnet.network_address + 1
+
+    @property
+    def service_gid(self):
+        """Group that may read the registry: the daemon drops to this user."""
+        user = self.setting("user")
+        if not user:
+            return None
+        try:
+            return pwd.getpwnam(user).pw_gid
+        except KeyError:
+            return None
+
+    @contextlib.contextmanager
+    def locked(self):
+        fd = os.open(self.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    # -- device registry ---------------------------------------------------
+
+    def load_devices(self):
+        path = self.devices_path
+        if not os.path.exists(path):
+            return []
+        devices = []
+        with open(path, encoding="utf-8") as f:
+            for n, raw in enumerate(f, 1):
+                line = raw.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                parts = line.split()
+                if len(parts) != 6:
+                    raise AdminError(f"{path}:{n}: malformed line; fix it by hand before using minivpn-admin")
+                did, key, ip, status, created, name = parts
+                devices.append(Device(did, key, ip, status, int(created), name))
+        return devices
+
+    def save_devices(self, devices):
+        header = (
+            "# minivpn device registry - managed by minivpn-admin.\n"
+            "# Contains secret keys. Fields: device_id key tunnel_ip status created name\n"
+        )
+        atomic_write(self.devices_path, header + "".join(d.line() for d in devices),
+                     mode=0o640, group=self.service_gid)
+
+    # -- daemon interaction -------------------------------------------------
+
+    def control(self, command, timeout=3.0):
+        """One request to the running daemon; None if it isn't running."""
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                s.connect(self.control_path)
+                s.sendall(command.encode() + b"\n")
+                chunks = []
+                while True:
+                    chunk = s.recv(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            return json.loads(b"".join(chunks) or b"{}")
+        except (OSError, ValueError):
+            return None
+
+    def license_info(self, path=None):
+        binary = os.environ.get("MINIVPN_BIN") or shutil.which("minivpn") or "/usr/sbin/minivpn"
+        try:
+            out = subprocess.run([binary, "license-info", "--license", path or self.license_path],
+                                 capture_output=True, text=True, timeout=10, check=True)
+            return json.loads(out.stdout)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return {"status": "unknown", "edition": "community", "customer": "", "expires": "",
+                    "license_id": "", "max_devices": COMMUNITY_LIMIT,
+                    "message": f"could not run {binary} to check the license"}
+
+
+# --------------------------------------------------------------------------
+# Operations (shared by the CLI and the web dashboard)
+# --------------------------------------------------------------------------
+
+class Admin:
+    def __init__(self, install, actor):
+        self.inst = install
+        self.actor = actor
+
+    def audit(self, action, device="", detail=""):
+        entry = {"time": int(time.time()), "actor": self.actor, "action": action,
+                 "device": device, "detail": detail}
+        fd = os.open(self.inst.audit_log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def audit_tail(self, limit=50):
+        try:
+            with open(self.inst.audit_log, encoding="utf-8") as f:
+                lines = f.readlines()[-limit:]
+        except FileNotFoundError:
+            return []
+        out = []
+        for line in reversed(lines):
+            with contextlib.suppress(ValueError):
+                out.append(json.loads(line))
+        return out
+
+    def notify_daemon(self):
+        reply = self.inst.control("reload")
+        if reply is None:
+            return "server is not running; changes apply when it starts"
+        if not reply.get("ok"):
+            return f"server could not reload: {reply.get('error', 'unknown error')}"
+        kicked = reply.get("kicked", 0)
+        msg = f"server reloaded ({reply.get('devices_loaded', 0)} device(s) active"
+        msg += f", {kicked} disconnected)" if kicked else ")"
+        return msg
+
+    def license(self):
+        return self.inst.license_info()
+
+    def _find(self, devices, name):
+        for d in devices:
+            if d.name == name:
+                return d
+        raise AdminError(f"no device named '{name}'")
+
+    def _check_limit(self, devices, extra=1):
+        lic = self.license()
+        active = sum(d.status == "active" for d in devices)
+        limit = int(lic.get("max_devices", COMMUNITY_LIMIT))
+        if active + extra > limit:
+            if lic.get("status") == "valid":
+                raise AdminError(f"your license allows {limit} active devices ({active} in use). "
+                                 "Disable or revoke a device, or upgrade the license.")
+            raise AdminError(f"the free Community edition allows {limit} active devices. "
+                             "Install a Business license to add more: minivpn-admin license install <file>")
+
+    def _allocate_ip(self, devices, requested=None):
+        net = self.inst.subnet
+        used = {d.ip for d in devices}
+        reserved = {str(net.network_address), str(net.broadcast_address), str(self.inst.server_ip)}
+        if requested:
+            try:
+                ip = ipaddress.ip_address(requested)
+            except ValueError:
+                raise AdminError(f"'{requested}' is not an IPv4 address")
+            if ip not in net or str(ip) in reserved:
+                raise AdminError(f"{ip} is not a usable address in {net}")
+            if str(ip) in used:
+                raise AdminError(f"{ip} is already assigned")
+            return str(ip)
+        for host in net.hosts():
+            if str(host) not in used and str(host) not in reserved:
+                return str(host)
+        raise AdminError(f"no free addresses left in {net}")
+
+    def client_config(self, device):
+        endpoint = self.inst.setting("endpoint")
+        if not endpoint:
+            raise AdminError(f"set 'endpoint = <public host or IP>' in {self.inst.server_conf} first")
+        port = self.inst.setting("port", "51900")
+        server = endpoint if ":" in endpoint else f"{endpoint}:{port}"
+        created = dt.datetime.fromtimestamp(device.created).strftime("%Y-%m-%d")
+        return (
+            f"# minivpn device configuration for \"{device.name}\" (created {created})\n"
+            "# Keep this file secret: anyone holding it can join your VPN as this device.\n"
+            f"# Connect:  sudo minivpn client --config {device.name}.conf\n"
+            f"name = {device.name}\n"
+            f"server = {server}\n"
+            f"device_id = {device.id}\n"
+            f"key = {device.key}\n"
+            "# route = 192.168.1.0/24      # reach a network behind the server\n"
+            "# redirect_gateway = yes      # send all internet traffic through the VPN\n"
+        )
+
+    # -- mutations ----------------------------------------------------------
+
+    def add_device(self, name, ip=None):
+        if not NAME_RE.match(name or ""):
+            raise AdminError("device names may use letters, digits, '.', '_' and '-' (max 32)")
+        with self.inst.locked():
+            devices = self.inst.load_devices()
+            if any(d.name == name for d in devices):
+                raise AdminError(f"a device named '{name}' already exists")
+            self._check_limit(devices)
+            device = Device(secrets.token_hex(16), secrets.token_hex(32), self._allocate_ip(devices, ip),
+                            "active", int(time.time()), name)
+            config = self.client_config(device)  # fail before saving if endpoint is missing
+            devices.append(device)
+            self.inst.save_devices(devices)
+        self.audit("add", name, device.ip)
+        return device, config, self.notify_daemon()
+
+    def set_status(self, name, status):
+        with self.inst.locked():
+            devices = self.inst.load_devices()
+            device = self._find(devices, name)
+            if device.status == status:
+                return f"'{name}' is already {status}"
+            if status == "active":
+                self._check_limit(devices)
+            device.status = status
+            self.inst.save_devices(devices)
+        self.audit("enable" if status == "active" else "disable", name)
+        return self.notify_daemon()
+
+    def revoke(self, name):
+        with self.inst.locked():
+            devices = self.inst.load_devices()
+            device = self._find(devices, name)
+            devices.remove(device)
+            self.inst.save_devices(devices)
+        self.audit("revoke", name, device.ip)
+        return self.notify_daemon()
+
+    def kick(self, name):
+        device = self._find(self.inst.load_devices(), name)
+        reply = self.inst.control(f"kick {device.id}")
+        if reply is None:
+            raise AdminError("server is not running")
+        if not reply.get("ok"):
+            raise AdminError(reply.get("error", "kick failed"))
+        self.audit("kick", name)
+        return f"'{name}' disconnected (it may reconnect; use disable to block it)"
+
+    def show_config(self, name):
+        return self.client_config(self._find(self.inst.load_devices(), name))
+
+    def install_license(self, text):
+        if len(text) > 4096:
+            raise AdminError("that does not look like a license file")
+        staging = os.path.join(self.inst.etc, f".license.{secrets.token_hex(4)}.check")
+        atomic_write(staging, text, mode=0o640, group=self.inst.service_gid)
+        try:
+            info = self.inst.license_info(staging)
+            if info.get("status") != "valid":
+                raise AdminError(f"license not installed: {info.get('message', 'invalid')}")
+            os.replace(staging, self.inst.license_path)
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(staging)
+        self.audit("license", "", f"{info['customer']} / {info['max_devices']} devices / until {info['expires']}")
+        return info, self.notify_daemon()
+
+    # -- read model for list/status/dashboard --------------------------------
+
+    def overview(self):
+        devices = self.inst.load_devices()
+        status = self.inst.control("status")
+        license = status["license"] if status and status.get("ok") else self.license()
+        sessions = {s["device_id"]: s for s in (status or {}).get("sessions", [])}
+        rows = []
+        for d in devices:
+            row = d.public()
+            s = sessions.get(d.id)
+            row["online"] = s is not None
+            if s:
+                row.update({k: s[k] for k in ("endpoint", "connected_at", "idle", "rx_bytes", "tx_bytes",
+                                              "rx_packets", "tx_packets", "session")})
+            rows.append(row)
+        server = None
+        if status and status.get("ok"):
+            server = {k: v for k, v in status.items() if k not in ("sessions", "license")}
+        return {
+            "server": server,
+            "license": license,
+            "devices": rows,
+            "active_devices": sum(d.status == "active" for d in devices),
+            "endpoint": self.inst.setting("endpoint", ""),
+            "subnet": str(self.inst.subnet),
+            "audit": self.audit_tail(30),
+        }
+
+
+# --------------------------------------------------------------------------
+# Passwords and the web dashboard
+# --------------------------------------------------------------------------
+
+def hash_password(password):
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, PBKDF2_ITERATIONS)
+    return "pbkdf2_sha256${}${}${}".format(
+        PBKDF2_ITERATIONS, base64.b64encode(salt).decode(), base64.b64encode(digest).decode())
+
+
+def verify_password(password, stored):
+    try:
+        scheme, iterations, salt, digest = stored.split("$")
+        if scheme != "pbkdf2_sha256":
+            return False
+        candidate = hashlib.pbkdf2_hmac("sha256", password.encode(), base64.b64decode(salt), int(iterations))
+        return hmac.compare_digest(candidate, base64.b64decode(digest))
+    except (ValueError, TypeError):
+        return False
+
+
+class WebState:
+    SESSION_IDLE = 30 * 60
+    SESSION_MAX = 12 * 3600
+    MAX_FAILURES = 5
+    LOCKOUT = 5 * 60
+
+    def __init__(self, install, secure_cookie, quiet=False):
+        self.inst = install
+        self.secure_cookie = secure_cookie
+        self.quiet = quiet
+        self.sessions = {}
+        self.failures = {}
+        self.lock = threading.Lock()
+
+    def credentials(self):
+        try:
+            with open(self.inst.admin_conf, encoding="utf-8") as f:
+                return json.load(f)
+        except (FileNotFoundError, ValueError):
+            return None
+
+    def login(self, ip, username, password):
+        now = time.time()
+        with self.lock:
+            fails = [t for t in self.failures.get(ip, []) if now - t < self.LOCKOUT]
+            self.failures[ip] = fails
+            if len(fails) >= self.MAX_FAILURES:
+                return None, "Too many failed attempts. Try again in a few minutes."
+        creds = self.credentials()
+        if not creds:
+            return None, "No admin password is set. Run: sudo minivpn-admin passwd"
+        user_ok = hmac.compare_digest(username.encode(), creds.get("username", "admin").encode())
+        if not (verify_password(password, creds.get("password", "")) and user_ok):
+            with self.lock:
+                self.failures.setdefault(ip, []).append(now)
+            return None, "Wrong username or password."
+        token = secrets.token_urlsafe(32)
+        with self.lock:
+            self.failures.pop(ip, None)
+            self.sessions[token] = {"user": username, "csrf": secrets.token_urlsafe(24),
+                                    "created": now, "seen": now}
+        return token, None
+
+    def session(self, token):
+        if not token:
+            return None
+        now = time.time()
+        with self.lock:
+            s = self.sessions.get(token)
+            if not s:
+                return None
+            if now - s["seen"] > self.SESSION_IDLE or now - s["created"] > self.SESSION_MAX:
+                del self.sessions[token]
+                return None
+            s["seen"] = now
+            return s
+
+    def logout(self, token):
+        with self.lock:
+            self.sessions.pop(token, None)
+
+
+def make_handler(state):
+    class Handler(http.server.BaseHTTPRequestHandler):
+        server_version = "minivpn-admin"
+        sys_version = ""
+
+        def log_message(self, fmt, *args):
+            if not state.quiet:
+                sys.stderr.write("%s %s %s\n" % (self.log_date_time_string(), self.client_address[0], fmt % args))
+
+        # -- plumbing -------------------------------------------------------
+
+        def _send(self, code, body, ctype="application/json", headers=None):
+            data = body if isinstance(body, bytes) else body.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _json(self, code, obj):
+            self._send(code, json.dumps(obj))
+
+        def _page(self, code, template, csrf="", extra=None):
+            nonce = secrets.token_urlsafe(16)
+            html_text = template.replace("__NONCE__", nonce).replace("__CSRF__", csrf)
+            for k, v in (extra or {}).items():
+                html_text = html_text.replace(k, v)
+            csp = (f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+                   "connect-src 'self'; img-src 'self' data:; form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+            self._send(code, html_text, "text/html; charset=utf-8", {"Content-Security-Policy": csp})
+
+        def _token(self):
+            for part in self.headers.get("Cookie", "").split(";"):
+                k, _, v = part.strip().partition("=")
+                if k == "minivpn_session":
+                    return v
+            return None
+
+        def _body(self, limit=65536):
+            length = int(self.headers.get("Content-Length") or 0)
+            if length > limit:
+                raise AdminError("request too large")
+            return self.rfile.read(length) if length else b""
+
+        def _same_origin(self):
+            origin = self.headers.get("Origin")
+            return origin is None or urllib.parse.urlparse(origin).netloc == self.headers.get("Host")
+
+        def _admin(self, session):
+            return Admin(state.inst, f"web:{session['user']}@{self.client_address[0]}")
+
+        # -- routes ---------------------------------------------------------
+
+        def do_GET(self):
+            path = urllib.parse.urlparse(self.path).path
+            session = state.session(self._token())
+            if path == "/":
+                if not session:
+                    return self._page(200, LOGIN_HTML, extra={"__ERROR__": ""})
+                return self._page(200, APP_HTML, csrf=session["csrf"])
+            if not session:
+                return self._json(401, {"error": "not signed in"})
+            try:
+                if path == "/api/overview":
+                    return self._json(200, self._admin(session).overview())
+                m = re.fullmatch(r"/api/devices/([A-Za-z0-9._-]{1,32})/config", path)
+                if m:
+                    text = self._admin(session).show_config(m.group(1))
+                    return self._send(200, text, "text/plain; charset=utf-8",
+                                      {"Content-Disposition": f'attachment; filename="{m.group(1)}.conf"'})
+            except AdminError as e:
+                return self._json(400, {"error": str(e)})
+            self._json(404, {"error": "not found"})
+
+        def do_POST(self):
+            path = urllib.parse.urlparse(self.path).path
+            if not self._same_origin():
+                return self._json(403, {"error": "cross-origin request refused"})
+            try:
+                body = self._body()
+            except AdminError as e:
+                return self._json(413, {"error": str(e)})
+
+            if path == "/login":
+                form = urllib.parse.parse_qs(body.decode(errors="replace"))
+                token, err = state.login(self.client_address[0], form.get("username", [""])[0],
+                                         form.get("password", [""])[0])
+                if not token:
+                    return self._page(401, LOGIN_HTML, extra={"__ERROR__": f'<p class="error">{err}</p>'})
+                cookie = f"minivpn_session={token}; Path=/; HttpOnly; SameSite=Strict"
+                if state.secure_cookie:
+                    cookie += "; Secure"
+                Admin(state.inst, f"web:{form['username'][0]}@{self.client_address[0]}").audit("login")
+                return self._send(303, "", "text/plain", {"Location": "/", "Set-Cookie": cookie})
+
+            session = state.session(self._token())
+            if not session:
+                return self._json(401, {"error": "not signed in"})
+            sent = self.headers.get("X-CSRF-Token", "").encode("utf-8", "replace")
+            if not hmac.compare_digest(sent, session["csrf"].encode()):
+                return self._json(403, {"error": "missing or invalid CSRF token"})
+
+            try:
+                data = json.loads(body or b"{}")
+            except ValueError:
+                return self._json(400, {"error": "invalid JSON"})
+            admin = self._admin(session)
+            try:
+                if path == "/logout":
+                    state.logout(self._token())
+                    return self._json(200, {"ok": True})
+                if path == "/api/devices":
+                    device, config, note = admin.add_device(str(data.get("name", "")).strip(),
+                                                            (data.get("ip") or "").strip() or None)
+                    return self._json(200, {"device": device.public(), "config": config, "note": note})
+                if path == "/api/license":
+                    info, note = admin.install_license(str(data.get("text", "")))
+                    return self._json(200, {"license": info, "note": note})
+                m = re.fullmatch(r"/api/devices/([A-Za-z0-9._-]{1,32})/(enable|disable|revoke|kick)", path)
+                if m:
+                    name, action = m.groups()
+                    note = {"enable": lambda: admin.set_status(name, "active"),
+                            "disable": lambda: admin.set_status(name, "disabled"),
+                            "revoke": lambda: admin.revoke(name),
+                            "kick": lambda: admin.kick(name)}[action]()
+                    return self._json(200, {"ok": True, "note": note})
+            except AdminError as e:
+                return self._json(400, {"error": str(e)})
+            self._json(404, {"error": "not found"})
+
+    return Handler
+
+
+def serve(install, listen, cert=None, key=None):
+    host, _, port = listen.rpartition(":")
+    host = host.strip("[]") or "127.0.0.1"
+    state = WebState(install, secure_cookie=bool(cert))
+    httpd = http.server.ThreadingHTTPServer((host, int(port)), make_handler(state))
+    httpd.daemon_threads = True
+    scheme = "http"
+    if cert:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.load_cert_chain(cert, key)
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        scheme = "https"
+    if not cert and not ipaddress.ip_address(host).is_loopback:
+        print("WARNING: serving the dashboard without TLS on a non-loopback address. "
+              "Use --tls-cert/--tls-key, or keep it on 127.0.0.1 and use an SSH tunnel.", file=sys.stderr)
+    if not state.credentials():
+        print("WARNING: no admin password set yet; run: sudo minivpn-admin passwd", file=sys.stderr)
+    print(f"minivpn dashboard on {scheme}://{host}:{port}/", file=sys.stderr, flush=True)
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def fmt_bytes(n):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def fmt_age(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    if seconds < 86400:
+        return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+    return f"{seconds // 86400}d{seconds % 86400 // 3600}h"
+
+
+def read_password(args, prompt="New admin password: "):
+    if args.password_stdin:
+        return sys.stdin.readline().rstrip("\n")
+    first = getpass.getpass(prompt)
+    if getpass.getpass("Repeat: ") != first:
+        raise AdminError("passwords do not match")
+    return first
+
+
+def set_password(inst, username, password):
+    if len(password) < MIN_PASSWORD:
+        raise AdminError(f"use at least {MIN_PASSWORD} characters")
+    atomic_write(inst.admin_conf, json.dumps({"username": username, "password": hash_password(password)}) + "\n",
+                 mode=0o600)
+
+
+def cmd_init(inst, args):
+    os.makedirs(inst.etc, mode=0o750, exist_ok=True)
+    try:
+        net = ipaddress.ip_network(args.subnet, strict=True)
+    except ValueError as e:
+        raise AdminError(f"invalid --subnet: {e}")
+    if not 16 <= net.prefixlen <= 29:
+        raise AdminError("--subnet must be between /16 and /29")
+    if os.path.exists(inst.server_conf) and not args.force:
+        raise AdminError(f"{inst.server_conf} already exists (use --force to overwrite)")
+    user = args.user
+    if user:
+        try:
+            pwd.getpwnam(user)
+        except KeyError:
+            print(f"note: user '{user}' does not exist; the server will refuse to start until it does "
+                  f"(create it with: useradd --system --no-create-home --shell /usr/sbin/nologin {user})")
+    conf = (
+        "# minivpn server configuration (see `minivpn --help`)\n"
+        f"endpoint = {args.endpoint}        # public host/IP clients connect to\n"
+        f"port = {args.port}\n"
+        f"subnet = {net}\n"
+        "mtu = 1400\n"
+        "interface = mvpn0\n"
+        "client_to_client = yes\n"
+        + (f"user = {user}\n" if user else "# user = minivpn\n")
+        + f"devices = {os.path.join(inst.etc, 'devices')}\n"
+        f"license = {os.path.join(inst.etc, 'license.key')}\n"
+        "control_socket = /run/minivpn/control.sock\n"
+    )
+    atomic_write(inst.server_conf, conf, mode=0o644)
+    # The daemon drops to `user` but re-reads the registry and license on
+    # reload, so its group needs to traverse this directory.
+    gid = inst.service_gid
+    if gid is not None and os.geteuid() == 0:
+        os.chown(inst.etc, 0, gid)
+    os.chmod(inst.etc, 0o750)
+    if not os.path.exists(inst.devices_path):
+        inst.save_devices([])
+    print(f"wrote {inst.server_conf}")
+    if not os.path.exists(inst.admin_conf):
+        if args.password_stdin or sys.stdin.isatty():
+            set_password(inst, "admin", read_password(args, "Choose a dashboard password for 'admin': "))
+            print(f"dashboard login: admin (password saved to {inst.admin_conf})")
+        else:
+            print("set a dashboard password with: minivpn-admin passwd")
+    print("next: minivpn-admin add <device-name>   then start the server: systemctl enable --now minivpn-server")
+
+
+def cmd_add(inst, args):
+    device, config, note = Admin(inst, "cli").add_device(args.name, args.ip)
+    if args.output:
+        atomic_write(args.output, config, mode=0o600)
+        print(f"added {device.name} ({device.ip}); config written to {args.output}", file=sys.stderr)
+    else:
+        sys.stdout.write(config)
+        print(f"added {device.name} ({device.ip}); copy the config above to the device", file=sys.stderr)
+    print(note, file=sys.stderr)
+
+
+def cmd_list(inst, args):
+    ov = Admin(inst, "cli").overview()
+    if args.json:
+        print(json.dumps(ov["devices"], indent=2))
+        return
+    if not ov["devices"]:
+        print("no devices yet; add one with: minivpn-admin add <name>")
+        return
+    fmt = "{:<22} {:<15} {:<9} {:<8} {:<22} {:>10} {:>10}"
+    print(fmt.format("NAME", "TUNNEL IP", "STATUS", "ONLINE", "CONNECTED FROM", "RECEIVED", "SENT"))
+    for d in ov["devices"]:
+        online = "yes" if d["online"] else "-"
+        print(fmt.format(d["name"], d["ip"], d["status"], online, d.get("endpoint", "-"),
+                         fmt_bytes(d["rx_bytes"]) if d["online"] else "-",
+                         fmt_bytes(d["tx_bytes"]) if d["online"] else "-"))
+    lic = ov["license"]
+    print(f"\n{ov['active_devices']} of {lic['max_devices']} licensed devices active ({lic['edition']} edition)")
+
+
+def cmd_status(inst, args):
+    admin = Admin(inst, "cli")
+    ov = admin.overview()
+    if args.json:
+        print(json.dumps(ov, indent=2))
+        return
+    srv, lic = ov["server"], ov["license"]
+    if srv:
+        online = sum(d["online"] for d in ov["devices"])
+        print(f"server:   running {srv['version']}, up {fmt_age(srv['uptime'])}, "
+              f"{srv['interface']} {srv['subnet']} on UDP {srv['port']}")
+        print(f"devices:  {online} online, {srv['devices_loaded']} authorised")
+        if srv["devices_over_limit"]:
+            print(f"WARNING:  {srv['devices_over_limit']} device(s) not loaded because of the license limit")
+    else:
+        print("server:   not running (start it with: systemctl start minivpn-server)")
+    print(f"license:  {lic['message']}")
+
+
+def cmd_set_status(status):
+    def run(inst, args):
+        print(Admin(inst, "cli").set_status(args.name, status))
+    return run
+
+
+def cmd_revoke(inst, args):
+    if not args.yes and sys.stdin.isatty():
+        if input(f"Permanently revoke '{args.name}'? Its config file will stop working. [y/N] ").lower() != "y":
+            print("cancelled")
+            return
+    print(Admin(inst, "cli").revoke(args.name))
+
+
+def cmd_kick(inst, args):
+    print(Admin(inst, "cli").kick(args.name))
+
+
+def cmd_show(inst, args):
+    sys.stdout.write(Admin(inst, "cli").show_config(args.name))
+
+
+def cmd_license(inst, args):
+    admin = Admin(inst, "cli")
+    if args.action == "show":
+        print(admin.license()["message"])
+        return
+    if not args.file:
+        raise AdminError("usage: minivpn-admin license install FILE")
+    with open(args.file, encoding="utf-8") as f:
+        info, note = admin.install_license(f.read())
+    print(f"installed: {info['message']}\n{note}")
+
+
+def cmd_reload(inst, args):
+    print(Admin(inst, "cli").notify_daemon())
+
+
+def cmd_passwd(inst, args):
+    os.makedirs(inst.etc, mode=0o750, exist_ok=True)
+    set_password(inst, args.username, read_password(args))
+    Admin(inst, "cli").audit("passwd", "", args.username)
+    print(f"dashboard password for '{args.username}' updated")
+
+
+def cmd_audit(inst, args):
+    for e in Admin(inst, "cli").audit_tail(args.limit):
+        when = dt.datetime.fromtimestamp(e["time"]).strftime("%Y-%m-%d %H:%M:%S")
+        print(f"{when}  {e['actor']:<28} {e['action']:<8} {e.get('device', ''):<20} {e.get('detail', '')}")
+
+
+def cmd_web(inst, args):
+    inst.conf  # fail early if not initialised
+    if bool(args.tls_cert) != bool(args.tls_key):
+        raise AdminError("--tls-cert and --tls-key go together")
+    serve(inst, args.listen, args.tls_cert, args.tls_key)
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(prog="minivpn-admin", description="Manage a minivpn server.")
+    p.add_argument("--etc", help="configuration directory (default $MINIVPN_ETC or /etc/minivpn)")
+    p.add_argument("--version", action="version", version=f"minivpn-admin {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    s = sub.add_parser("init", help="create server.conf, the device registry and a dashboard password")
+    s.add_argument("--endpoint", required=True, help="public hostname or IP that devices connect to")
+    s.add_argument("--subnet", default="10.8.0.0/24")
+    s.add_argument("--port", type=int, default=51900)
+    s.add_argument("--user", default="minivpn", help="unprivileged user the server runs as ('' for none)")
+    s.add_argument("--force", action="store_true")
+    s.add_argument("--password-stdin", action="store_true")
+    s.set_defaults(func=cmd_init)
+
+    s = sub.add_parser("add", help="register a device and print its config file")
+    s.add_argument("name")
+    s.add_argument("--ip", help="fixed tunnel address (default: next free)")
+    s.add_argument("-o", "--output", help="write the config to this file instead of stdout")
+    s.set_defaults(func=cmd_add)
+
+    s = sub.add_parser("list", help="list devices with online status")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_list)
+
+    s = sub.add_parser("status", help="server, license and connection summary")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(func=cmd_status)
+
+    for name, status in (("enable", "active"), ("disable", "disabled")):
+        s = sub.add_parser(name, help=f"{name} a device (keeps its address and key)")
+        s.add_argument("name")
+        s.set_defaults(func=cmd_set_status(status))
+
+    s = sub.add_parser("revoke", help="delete a device permanently")
+    s.add_argument("name")
+    s.add_argument("-y", "--yes", action="store_true")
+    s.set_defaults(func=cmd_revoke)
+
+    s = sub.add_parser("kick", help="disconnect a device now (it may reconnect)")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_kick)
+
+    s = sub.add_parser("show", help="print a device's config file again")
+    s.add_argument("name")
+    s.set_defaults(func=cmd_show)
+
+    s = sub.add_parser("license", help="show or install a license")
+    s.add_argument("action", choices=["show", "install"])
+    s.add_argument("file", nargs="?")
+    s.set_defaults(func=cmd_license)
+
+    s = sub.add_parser("reload", help="make the running server re-read devices and license")
+    s.set_defaults(func=cmd_reload)
+
+    s = sub.add_parser("passwd", help="set the dashboard password")
+    s.add_argument("--username", default="admin")
+    s.add_argument("--password-stdin", action="store_true")
+    s.set_defaults(func=cmd_passwd)
+
+    s = sub.add_parser("audit", help="show the administrator activity log")
+    s.add_argument("-n", "--limit", type=int, default=50)
+    s.set_defaults(func=cmd_audit)
+
+    s = sub.add_parser("web", help="run the web dashboard")
+    s.add_argument("--listen", default="127.0.0.1:8090", help="address:port (default 127.0.0.1:8090)")
+    s.add_argument("--tls-cert")
+    s.add_argument("--tls-key")
+    s.set_defaults(func=cmd_web)
+
+    args = p.parse_args(argv)
+    inst = Install(args.etc)
+    try:
+        args.func(inst, args)
+    except AdminError as e:
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except PermissionError as e:
+        print(f"error: {e} (run as root)", file=sys.stderr)
+        return 1
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Web pages
+# --------------------------------------------------------------------------
+
+BASE_CSS = r"""
+:root{--bg:#f6f7f9;--panel:#fff;--text:#14171c;--muted:#5d6673;--line:#e3e6eb;--accent:#2f6fed;--accent-ink:#fff;
+--ok:#1f9d55;--warn:#b7791f;--bad:#d64545;--chip:#eef1f5;--shadow:0 1px 2px rgba(16,24,40,.06),0 1px 3px rgba(16,24,40,.08)}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1216;--panel:#171b21;--text:#e7eaee;--muted:#98a2b3;--line:#262c35;
+--accent:#5b8cff;--accent-ink:#0b0e12;--ok:#3fbf7a;--warn:#e0a43a;--bad:#ef6b6b;--chip:#20262e;--shadow:none}}
+*{box-sizing:border-box}html,body{margin:0}body{background:var(--bg);color:var(--text);
+font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+button,input,textarea{font:inherit;color:inherit}
+.btn{border:1px solid var(--line);background:var(--panel);border-radius:8px;padding:7px 12px;cursor:pointer;white-space:nowrap;text-decoration:none;display:inline-block}
+.btn:hover{border-color:var(--muted)}.btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
+.btn.danger{color:var(--bad)}.btn.small{padding:3px 9px;font-size:12.5px}
+input[type=text],input[type=password],textarea{width:100%;border:1px solid var(--line);background:var(--bg);border-radius:8px;padding:9px 11px}
+input:focus,textarea:focus,.btn:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+.error{color:var(--bad);margin:0 0 12px}
+"""
+
+LOGIN_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>minivpn admin</title>
+<style nonce="__NONCE__">""" + BASE_CSS + r"""
+.wrap{min-height:100vh;display:grid;place-items:center;padding:16px}
+.card{width:100%;max-width:360px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:28px;box-shadow:var(--shadow)}
+h1{font-size:20px;margin:0 0 4px;display:flex;align-items:center;gap:8px}p.sub{color:var(--muted);margin:0 0 20px}
+label{display:block;font-weight:600;font-size:13px;margin:12px 0 6px}.btn{width:100%;margin-top:18px;padding:10px}
+</style></head><body><div class="wrap"><form class="card" method="post" action="/login">
+<h1><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6z"/><path d="M9 12l2 2 4-4"/></svg>minivpn</h1>
+<p class="sub">Sign in to manage your VPN.</p>__ERROR__
+<label for="u">Username</label><input type="text" id="u" name="username" value="admin" autocomplete="username" required>
+<label for="p">Password</label><input type="password" id="p" name="password" autocomplete="current-password" autofocus required>
+<button class="btn primary" type="submit">Sign in</button></form></div></body></html>"""
+
+APP_HTML = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>minivpn admin</title>
+<meta name="csrf" content="__CSRF__">
+<style nonce="__NONCE__">""" + BASE_CSS + r"""
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 24px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:2}
+.brand{display:flex;align-items:center;gap:8px;font-weight:700;font-size:16px}
+.chip{font-size:12px;font-weight:600;padding:2px 8px;border-radius:999px;background:var(--chip);color:var(--muted)}
+.chip.biz{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent)}
+.right{display:flex;align-items:center;gap:10px}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:13px;color:var(--muted)}
+.dot{width:8px;height:8px;border-radius:50%;background:var(--muted);flex:none}.dot.on{background:var(--ok);box-shadow:0 0 0 3px color-mix(in srgb,var(--ok) 22%,transparent)}
+.dot.off{background:var(--bad)}.dot.idle{background:var(--line)}
+main{max-width:1180px;margin:0 auto;padding:24px}
+.banner{border:1px solid color-mix(in srgb,var(--warn) 45%,var(--line));background:color-mix(in srgb,var(--warn) 10%,var(--panel));border-radius:10px;padding:10px 14px;margin-bottom:16px}
+.banner.bad{border-color:color-mix(in srgb,var(--bad) 45%,var(--line));background:color-mix(in srgb,var(--bad) 9%,var(--panel))}
+.stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:18px}
+.stat,.panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow)}
+.stat{padding:14px 16px}.stat .label{color:var(--muted);font-size:12.5px}.stat .value{font-size:24px;font-weight:700;letter-spacing:-.01em;font-variant-numeric:tabular-nums}
+.stat .sub{color:var(--muted);font-size:12.5px;font-variant-numeric:tabular-nums}
+.meter{height:5px;background:var(--chip);border-radius:3px;margin-top:8px;overflow:hidden}.meter>i{display:block;width:0;height:100%;background:var(--accent);transition:width .3s}
+.panel{padding:16px;margin-bottom:18px}.panel h2{font-size:15px;margin:0}
+.head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px;flex-wrap:wrap}
+.head .tools{display:flex;gap:8px}.head input{width:200px}
+.tablewrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th{text-align:left;font-size:12px;font-weight:600;color:var(--muted);padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:10px;border-bottom:1px solid var(--line);white-space:nowrap;vertical-align:middle}tr:last-child td{border-bottom:0}
+td.name{font-weight:600}td.name .d{display:flex;align-items:center;gap:8px}td .muted,.muted{color:var(--muted)}
+td.actions{text-align:right}td.actions .btn{margin-left:4px}
+.tag{font-size:11.5px;padding:1px 7px;border-radius:999px;background:var(--chip);color:var(--muted)}
+.empty{color:var(--muted);text-align:center;padding:28px 8px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+dl{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;margin:12px 0 14px}dt{color:var(--muted)}dd{margin:0}
+.audit{list-style:none;margin:10px 0 0;padding:0;max-height:260px;overflow:auto}
+.audit li{display:flex;gap:10px;padding:7px 0;border-bottom:1px solid var(--line);font-size:13px}.audit li:last-child{border:0}
+.audit time{color:var(--muted);flex:none;width:118px;font-variant-numeric:tabular-nums}
+.audit .who{margin-left:auto;color:var(--muted);text-align:right}
+dialog{border:1px solid var(--line);border-radius:14px;padding:0;background:var(--panel);color:var(--text);width:min(560px,calc(100% - 32px));box-shadow:0 20px 50px rgba(0,0,0,.25)}
+dialog::backdrop{background:rgba(10,12,16,.45)}
+.dlg{padding:20px}.dlg h3{margin:0 0 6px;font-size:17px}.dlg p{margin:0 0 14px;color:var(--muted)}
+.dlg .row{display:flex;justify-content:flex-end;gap:8px;margin-top:16px}
+pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:12px;font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;overflow:auto;white-space:pre;max-height:280px}
+textarea{min-height:170px;font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);background:var(--text);color:var(--bg);padding:9px 14px;border-radius:9px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;max-width:calc(100% - 32px)}
+.toast.show{opacity:1}
+@media (max-width:860px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}.grid{grid-template-columns:1fr}header,main{padding-left:16px;padding-right:16px}.head input{width:auto;flex:1;min-width:0}.head .tools{width:100%}
+.audit li{flex-wrap:wrap}.audit .who{flex-basis:100%;margin-left:128px;text-align:left;font-size:12px}}
+</style></head><body>
+<header><div class="brand"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6z"/><path d="M9 12l2 2 4-4"/></svg>minivpn<span class="chip" id="edition">…</span></div>
+<div class="right"><span class="pill"><span class="dot" id="srv-dot"></span><span id="srv-text">Connecting…</span></span><button class="btn small" id="logout">Sign out</button></div></header>
+<main>
+<div id="banners"></div>
+<section class="stats">
+<div class="stat"><div class="label">Devices online</div><div class="value" id="s-online">–</div><div class="sub" id="s-online-sub">&nbsp;</div></div>
+<div class="stat"><div class="label">Licensed devices</div><div class="value" id="s-used">–</div><div class="meter"><i id="s-meter"></i></div></div>
+<div class="stat"><div class="label">Throughput now</div><div class="value" id="s-rate">–</div><div class="sub" id="s-rate-sub">&nbsp;</div></div>
+<div class="stat"><div class="label">Server uptime</div><div class="value" id="s-uptime">–</div><div class="sub" id="s-endpoint">&nbsp;</div></div>
+</section>
+<section class="panel"><div class="head"><h2>Devices</h2><div class="tools"><input type="text" id="filter" placeholder="Filter devices" aria-label="Filter devices"><button class="btn primary" id="add">Add device</button></div></div>
+<div class="tablewrap"><table><thead><tr><th>Device</th><th>Tunnel IP</th><th>Connected from</th><th>Online for</th><th>Received</th><th>Sent</th><th>Rate</th><th></th></tr></thead>
+<tbody id="rows"></tbody></table></div><div class="empty" id="empty" hidden>No devices yet. Add one to generate its configuration file.</div></section>
+<div class="grid">
+<section class="panel"><div class="head"><h2>License</h2><button class="btn small" id="lic-btn">Install license</button></div><dl id="lic"></dl><div class="muted" id="lic-msg"></div></section>
+<section class="panel"><h2>Activity</h2><ul class="audit" id="audit"></ul></section>
+</div></main>
+
+<dialog id="dlg-add"><form class="dlg" method="dialog" id="form-add"><h3>Add a device</h3>
+<p>Each device gets its own key and a fixed tunnel address. You can revoke it at any time.</p>
+<label class="muted" for="add-name">Device name</label><input type="text" id="add-name" placeholder="alice-laptop" pattern="[A-Za-z0-9._-]{1,32}" required>
+<div class="error" id="add-err" hidden></div>
+<div class="row"><button class="btn" value="cancel" formnovalidate>Cancel</button><button class="btn primary" id="add-go" value="ok">Create</button></div></form></dialog>
+
+<dialog id="dlg-config"><div class="dlg"><h3 id="cfg-title">Device configuration</h3>
+<p>Copy this file to the device and connect with <code>sudo minivpn client --config FILE</code>. It contains the device's secret key.</p>
+<pre id="cfg-text"></pre><div class="row"><button class="btn" id="cfg-copy">Copy</button><a class="btn" id="cfg-dl" download>Download</a><button class="btn primary" id="cfg-close">Done</button></div></div></dialog>
+
+<dialog id="dlg-lic"><form class="dlg" method="dialog" id="form-lic"><h3>Install license</h3>
+<p>Paste the contents of the license file you received.</p><textarea id="lic-text" required></textarea>
+<div class="error" id="lic-err" hidden></div>
+<div class="row"><button class="btn" value="cancel" formnovalidate>Cancel</button><button class="btn primary" value="ok">Install</button></div></form></dialog>
+
+<dialog id="dlg-confirm"><form class="dlg" method="dialog"><h3 id="cf-title"></h3><p id="cf-text"></p>
+<div class="row"><button class="btn" value="cancel">Cancel</button><button class="btn primary" id="cf-ok" value="ok">Confirm</button></div></form></dialog>
+<div class="toast" id="toast" role="status"></div>
+
+<script nonce="__NONCE__">
+"use strict";
+const $ = (id) => document.getElementById(id);
+const csrf = document.querySelector('meta[name="csrf"]').content;
+let last = null, prevSample = null, rates = {};
+
+async function api(method, path, body) {
+  const r = await fetch(path, {method, credentials: "same-origin",
+    headers: {"Content-Type": "application/json", "X-CSRF-Token": csrf},
+    body: body === undefined ? undefined : JSON.stringify(body)});
+  if (r.status === 401) { location.href = "/"; throw new Error("signed out"); }
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+function bytes(n) { if (n == null) return "–"; const u = ["B","KB","MB","GB","TB"]; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; } return (i ? n.toFixed(1) : n.toFixed(0)) + " " + u[i]; }
+function rate(bps) { if (!bps) return "0 bit/s"; const u = ["bit/s","kbit/s","Mbit/s","Gbit/s"]; let v = bps * 8, i = 0;
+  while (v >= 1000 && i < u.length - 1) { v /= 1000; i++; } return v.toFixed(v < 10 && i ? 1 : 0) + " " + u[i]; }
+function dur(s) { s = Math.max(0, Math.floor(s)); if (s < 60) return s + "s"; if (s < 3600) return Math.floor(s/60) + "m";
+  if (s < 86400) return Math.floor(s/3600) + "h " + Math.floor(s%3600/60) + "m"; return Math.floor(s/86400) + "d " + Math.floor(s%86400/3600) + "h"; }
+function el(tag, attrs, ...kids) { const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) { if (k === "class") e.className = v; else if (k.startsWith("data-")) e.setAttribute(k, v); else e[k] = v; }
+  for (const k of kids) e.append(k instanceof Node ? k : document.createTextNode(k ?? "")); return e; }
+function toast(msg) { const t = $("toast"); t.textContent = msg; t.classList.add("show"); clearTimeout(toast.t); toast.t = setTimeout(() => t.classList.remove("show"), 3200); }
+
+function sample(o) {
+  const now = performance.now(), cur = {};
+  for (const d of o.devices) if (d.online) cur[d.id + d.session] = {rx: d.rx_bytes, tx: d.tx_bytes};
+  if (prevSample) { const dt = (now - prevSample.t) / 1000; rates = {};
+    for (const [k, v] of Object.entries(cur)) { const p = prevSample.cur[k];
+      if (p && dt > 0) rates[k] = {rx: Math.max(0, (v.rx - p.rx) / dt), tx: Math.max(0, (v.tx - p.tx) / dt)}; } }
+  prevSample = {t: now, cur};
+}
+
+function render(o) {
+  last = o; sample(o);
+  const srv = o.server, lic = o.license, online = o.devices.filter(d => d.online).length;
+  $("edition").textContent = lic.edition.charAt(0).toUpperCase() + lic.edition.slice(1);
+  $("edition").className = "chip" + (lic.edition !== "community" ? " biz" : "");
+  $("srv-dot").className = "dot " + (srv ? "on" : "off");
+  $("srv-text").textContent = srv ? "Server running" : "Server offline";
+
+  const banners = $("banners"); banners.replaceChildren();
+  if (!srv) banners.append(el("div", {class: "banner bad"}, "The VPN server is not running. Devices cannot connect. Start it with: systemctl start minivpn-server"));
+  if (lic.status === "expired" || lic.status === "invalid") banners.append(el("div", {class: "banner bad"}, lic.message));
+  if (srv && srv.devices_over_limit) banners.append(el("div", {class: "banner"}, srv.devices_over_limit + " device(s) cannot connect because the license limit is reached."));
+  if (!o.endpoint) banners.append(el("div", {class: "banner"}, "Set 'endpoint' in server.conf so device configs know where to connect."));
+
+  $("s-online").textContent = online;
+  $("s-online-sub").textContent = "of " + o.devices.length + " registered";
+  $("s-used").textContent = o.active_devices + " / " + lic.max_devices;
+  $("s-meter").style.width = Math.min(100, 100 * o.active_devices / Math.max(1, lic.max_devices)) + "%";
+  let rin = 0, rout = 0; for (const r of Object.values(rates)) { rin += r.rx; rout += r.tx; }
+  $("s-rate").textContent = rate(rin + rout);
+  $("s-rate-sub").textContent = "in " + rate(rin) + " · out " + rate(rout);
+  $("s-uptime").textContent = srv ? dur(srv.uptime) : "–";
+  $("s-endpoint").textContent = o.endpoint ? o.endpoint + " · " + o.subnet : o.subnet;
+
+  const q = $("filter").value.trim().toLowerCase(), rows = $("rows"); rows.replaceChildren();
+  const list = o.devices.filter(d => !q || d.name.toLowerCase().includes(q) || d.ip.includes(q))
+    .sort((a, b) => (b.online - a.online) || a.name.localeCompare(b.name));
+  const nowSec = Date.now() / 1000;
+  for (const d of list) {
+    const r = rates[d.id + d.session], disabled = d.status !== "active";
+    const name = el("div", {class: "d"}, el("span", {class: "dot " + (d.online ? "on" : "idle"), title: d.online ? "online" : "offline"}), d.name);
+    if (disabled) name.append(el("span", {class: "tag"}, "disabled"));
+    const acts = el("td", {class: "actions"},
+      el("button", {class: "btn small", "data-act": "config", "data-name": d.name}, "Config"),
+      el("button", {class: "btn small", "data-act": disabled ? "enable" : "disable", "data-name": d.name}, disabled ? "Enable" : "Disable"));
+    if (d.online) acts.append(el("button", {class: "btn small", "data-act": "kick", "data-name": d.name}, "Disconnect"));
+    acts.append(el("button", {class: "btn small danger", "data-act": "revoke", "data-name": d.name}, "Revoke"));
+    rows.append(el("tr", {},
+      el("td", {class: "name"}, name), el("td", {}, d.ip),
+      el("td", {class: d.online ? "" : "muted"}, d.online ? d.endpoint : "offline"),
+      el("td", {class: "muted"}, d.online ? dur(nowSec - d.connected_at) : "–"),
+      el("td", {}, d.online ? bytes(d.rx_bytes) : "–"), el("td", {}, d.online ? bytes(d.tx_bytes) : "–"),
+      el("td", {class: "muted"}, r ? rate(r.rx + r.tx) : "–"), acts));
+  }
+  $("empty").hidden = o.devices.length > 0;
+
+  const dl = $("lic"); dl.replaceChildren();
+  const add = (k, v) => dl.append(el("dt", {}, k), el("dd", {}, v));
+  add("Edition", $("edition").textContent);
+  if (lic.status === "valid") { add("Licensed to", lic.customer); add("Valid until", lic.expires); add("License ID", lic.license_id); }
+  add("Device limit", String(lic.max_devices));
+  $("lic-msg").textContent = lic.status === "valid" ? "" : "Upgrade to Business for more devices and priority support.";
+
+  const audit = $("audit"); audit.replaceChildren();
+  for (const e of o.audit) {
+    const when = new Date(e.time * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"});
+    audit.append(el("li", {}, el("time", {}, when), el("span", {}, e.action + (e.device ? " " + e.device : "") + (e.detail ? " · " + e.detail : "")),
+      el("span", {class: "who"}, e.actor)));
+  }
+  if (!o.audit.length) audit.append(el("li", {class: "muted"}, "No activity yet."));
+}
+
+async function refresh() { try { render(await api("GET", "/api/overview")); } catch (e) { if (e.message !== "signed out") $("srv-text").textContent = "Dashboard error: " + e.message; } }
+
+function showConfig(name, text) {
+  $("cfg-title").textContent = "Configuration for " + name; $("cfg-text").textContent = text;
+  const a = $("cfg-dl"); URL.revokeObjectURL(a.href); a.href = URL.createObjectURL(new Blob([text], {type: "text/plain"})); a.download = name + ".conf";
+  $("dlg-config").showModal();
+}
+function confirmDlg(title, text, label) {
+  return new Promise(res => { $("cf-title").textContent = title; $("cf-text").textContent = text; $("cf-ok").textContent = label;
+    const d = $("dlg-confirm"); d.returnValue = ""; d.showModal(); d.addEventListener("close", () => res(d.returnValue === "ok"), {once: true}); });
+}
+
+$("rows").addEventListener("click", async (ev) => {
+  const b = ev.target.closest("button[data-act]"); if (!b) return;
+  const act = b.dataset.act, name = b.dataset.name;
+  try {
+    if (act === "config") { const r = await fetch("/api/devices/" + encodeURIComponent(name) + "/config", {credentials: "same-origin"});
+      if (!r.ok) throw new Error((await r.json()).error); return showConfig(name, await r.text()); }
+    if (act === "revoke" && !await confirmDlg("Revoke " + name + "?", "The device is disconnected and its configuration file stops working permanently.", "Revoke")) return;
+    if (act === "disable" && !await confirmDlg("Disable " + name + "?", "The device is disconnected and blocked until you enable it again.", "Disable")) return;
+    const r = await api("POST", "/api/devices/" + encodeURIComponent(name) + "/" + act);
+    toast(r.note || "Done"); refresh();
+  } catch (e) { toast(e.message); }
+});
+$("add").addEventListener("click", () => { $("add-err").hidden = true; $("add-name").value = ""; $("dlg-add").showModal(); });
+$("form-add").addEventListener("submit", async (ev) => {
+  if (ev.submitter && ev.submitter.value !== "ok") return;
+  ev.preventDefault();
+  try { const r = await api("POST", "/api/devices", {name: $("add-name").value.trim()});
+    $("dlg-add").close(); showConfig(r.device.name, r.config); toast(r.note); refresh();
+  } catch (e) { $("add-err").textContent = e.message; $("add-err").hidden = false; }
+});
+$("lic-btn").addEventListener("click", () => { $("lic-err").hidden = true; $("lic-text").value = ""; $("dlg-lic").showModal(); });
+$("form-lic").addEventListener("submit", async (ev) => {
+  if (ev.submitter && ev.submitter.value !== "ok") return;
+  ev.preventDefault();
+  try { const r = await api("POST", "/api/license", {text: $("lic-text").value}); $("dlg-lic").close(); toast(r.license.message); refresh(); }
+  catch (e) { $("lic-err").textContent = e.message; $("lic-err").hidden = false; }
+});
+$("cfg-close").addEventListener("click", () => $("dlg-config").close());
+$("cfg-copy").addEventListener("click", async () => { try { await navigator.clipboard.writeText($("cfg-text").textContent); toast("Copied"); } catch { toast("Copy failed; select the text instead"); } });
+$("filter").addEventListener("input", () => last && render(last));
+$("logout").addEventListener("click", async () => { try { await api("POST", "/logout", {}); } finally { location.href = "/"; } });
+refresh(); setInterval(refresh, 3000);
+</script></body></html>"""
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,12 @@
+/minivpn
+/tests/unit_tests
+/tools/license-tool
+/build/
+*.o
+*.d
+*.conf
+!/packaging/server.conf
+__pycache__/
+
+# Your license-signing private key. NEVER commit or share it; back it up offline.
+/vendor/

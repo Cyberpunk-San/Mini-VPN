@@ -1,0 +1,30 @@
+# Connect this machine as a device. Put the config from `minivpn-admin add`
+# at /etc/minivpn/clients/NAME.conf (mode 600), then:
+#   systemctl enable --now minivpn-client@NAME
+[Unit]
+Description=minivpn client (%i)
+Documentation=file:///usr/share/doc/minivpn/README.md
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/minivpn/clients/%i.conf
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/minivpn client --config /etc/minivpn/clients/%i.conf
+Restart=always
+RestartSec=5s
+
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
