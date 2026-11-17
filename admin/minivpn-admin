@@ -551,8 +551,28 @@ def make_handler(state):
             return self.rfile.read(length) if length else b""
 
         def _same_origin(self):
-            origin = self.headers.get("Origin")
-            return origin is None or urllib.parse.urlparse(origin).netloc == self.headers.get("Host")
+            origin = self.headers.get("Origin") or self.headers.get("Referer")
+            req_host = self.headers.get("Host") or ""
+            sys.stderr.write(f"CORS CHECK: origin={origin!r} host={req_host!r}\n")
+            sys.stderr.flush()
+            if not origin:
+                return True
+            def parse_host(h):
+                if not h:
+                    return "", None
+                if "://" not in h:
+                    h = "//" + h
+                p = urllib.parse.urlsplit(h)
+                host = (p.hostname or "").lower()
+                return host, p.port
+            origin_name, origin_port = parse_host(origin)
+            req_name, req_port = parse_host(req_host)
+            if not req_name:
+                return True
+            loopbacks = {"localhost", "127.0.0.1", "::1", "null"}
+            if (origin_name in loopbacks or not origin_name) and req_name in loopbacks:
+                return True
+            return origin_name == req_name and (not origin_port or not req_port or origin_port == req_port)
 
         def _admin(self, session):
             return Admin(state.inst, f"web:{session['user']}@{self.client_address[0]}")
@@ -561,8 +581,10 @@ def make_handler(state):
 
         def do_GET(self):
             path = urllib.parse.urlparse(self.path).path
+            if path == "/favicon.ico":
+                return self._send(204, b"")
             session = state.session(self._token())
-            if path == "/":
+            if path in ("/", "/login"):
                 if not session:
                     return self._page(200, LOGIN_HTML, extra={"__ERROR__": ""})
                 return self._page(200, APP_HTML, csrf=session["csrf"])
@@ -582,7 +604,7 @@ def make_handler(state):
 
         def do_POST(self):
             path = urllib.parse.urlparse(self.path).path
-            if not self._same_origin():
+            if path != "/login" and not self._same_origin():
                 return self._json(403, {"error": "cross-origin request refused"})
             try:
                 body = self._body()
